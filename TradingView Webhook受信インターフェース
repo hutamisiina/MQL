@@ -1,0 +1,331 @@
+import os
+import hmac
+import hashlib
+import json
+import time
+from typing import Dict, Any, Optional, List, Callable
+import logging
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+import secrets
+import re
+
+class TradingViewWebhookInterface:
+    """
+    TradingViewからのWebhookアラートを受信するためのインターフェース。
+    認証、バリデーション、イベント処理を提供します。
+    """
+
+    def __init__(self, secret_key: Optional[str] = None, 
+                 host: str = "0.0.0.0", 
+                 port: int = 5000, 
+                 debug: bool = False):
+        """
+        TradingView Webhook受信インターフェースを初期化します。
+
+        Args:
+            secret_key: Webhookを認証するための秘密鍵（なければ自動生成）
+            host: サーバーのホストアドレス
+            port: サーバーのポート番号
+            debug: デバッグモードを有効にするかどうか
+        """
+        # 秘密鍵がなければ生成
+        self.secret_key = secret_key if secret_key else secrets.token_hex(32)
+        self.host = host
+        self.port = port
+        self.debug = debug
+        
+        # Flaskアプリケーションの設定
+        self.app = Flask(__name__)
+        CORS(self.app)  # CORS対応
+        
+        # ロガーのセットアップ
+        self.logger = self._setup_logger()
+        
+        # イベントハンドラの初期化
+        self.alert_handlers: List[Callable[[Dict[str, Any]], Any]] = []
+        
+        # 必要なルートを設定
+        self._setup_routes()
+        
+        # 受信したアラートの保存場所（実際の実装ではデータベースを使用する）
+        self.received_alerts: List[Dict[str, Any]] = []
+        
+        # アラートスキーマの定義
+        self.required_fields = ["time", "exchange", "ticker", "bar", "strategy"]
+        self.optional_fields = ["action", "price", "position_size", "comment", "charts"]
+        
+        # レート制限のための変数
+        self.rate_limit = {
+            "max_requests": 60,  # 1分間あたりの最大リクエスト数
+            "window_seconds": 60,  # 時間枠（秒）
+            "ip_requests": {}  # IPごとのリクエスト記録
+        }
+        
+    def _setup_logger(self) -> logging.Logger:
+        """ロギングの設定を行います。"""
+        logger = logging.getLogger("TradingViewWebhook")
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        return logger
+    
+    def _setup_routes(self) -> None:
+        """Flaskルートを設定します。"""
+        # メインのWebhookエンドポイント
+        @self.app.route('/webhook', methods=['POST'])
+        def webhook():
+            return self._handle_webhook()
+        
+        # ヘルスチェックエンドポイント
+        @self.app.route('/health', methods=['GET'])
+        def health():
+            return jsonify({"status": "ok", "timestamp": time.time()})
+        
+        # テスト接続用エンドポイント
+        @self.app.route('/test', methods=['POST'])
+        def test():
+            return jsonify({
+                "status": "success",
+                "message": "テスト接続が成功しました",
+                "timestamp": time.time()
+            })
+    
+    def _rate_limit_check(self, ip: str) -> bool:
+        """
+        レート制限をチェックします。
+        
+        Args:
+            ip: チェックするIPアドレス
+            
+        Returns:
+            bool: 制限を超えていなければTrue、超えていればFalse
+        """
+        current_time = time.time()
+        
+        # IPが記録になければ初期化
+        if ip not in self.rate_limit["ip_requests"]:
+            self.rate_limit["ip_requests"][ip] = []
+        
+        # 古いリクエストをクリア
+        self.rate_limit["ip_requests"][ip] = [
+            t for t in self.rate_limit["ip_requests"][ip]
+            if current_time - t < self.rate_limit["window_seconds"]
+        ]
+        
+        # リクエスト数をチェック
+        if len(self.rate_limit["ip_requests"][ip]) >= self.rate_limit["max_requests"]:
+            return False
+        
+        # 新しいリクエストを記録
+        self.rate_limit["ip_requests"][ip].append(current_time)
+        return True
+    
+    def _validate_signature(self, payload: bytes, signature: str) -> bool:
+        """
+        受信したペイロードとシグネチャを検証します。
+        
+        Args:
+            payload: 受信したリクエストのペイロード
+            signature: 受信したシグネチャ
+            
+        Returns:
+            bool: シグネチャが一致すればTrue、そうでなければFalse
+        """
+        # HMAC-SHA256を使用してシグネチャを計算
+        computed_signature = hmac.new(
+            self.secret_key.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        
+        # タイミング攻撃を防ぐために一定時間の比較を使用
+        return hmac.compare_digest(computed_signature, signature)
+    
+    def _validate_alert_data(self, data: Dict[str, Any]) -> bool:
+        """
+        アラートデータを検証します。
+        
+        Args:
+            data: 検証するアラートデータ
+            
+        Returns:
+            bool: データが有効であればTrue、そうでなければFalse
+        """
+        # 必須フィールドのチェック
+        for field in self.required_fields:
+            if field not in data:
+                self.logger.error(f"必須フィールドがありません: {field}")
+                return False
+        
+        # 時間のフォーマットをチェック（Unix timestamp または ISO 8601）
+        if isinstance(data.get("time"), (int, float)):
+            # Unixタイムスタンプは正常
+            pass
+        elif isinstance(data.get("time"), str):
+            # ISO 8601フォーマットをチェック
+            iso_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$'
+            if not re.match(iso_pattern, data["time"]):
+                self.logger.error(f"無効な時間フォーマット: {data['time']}")
+                return False
+        else:
+            self.logger.error(f"無効な時間フォーマット: {data.get('time')}")
+            return False
+        
+        # ティッカーシンボルのバリデーション
+        ticker_pattern = r'^[A-Za-z0-9.:\-_]+$'
+        if not re.match(ticker_pattern, data["ticker"]):
+            self.logger.error(f"無効なティッカーシンボル: {data['ticker']}")
+            return False
+        
+        return True
+    
+    def _handle_webhook(self) -> Any:
+        """
+        Webhookリクエストを処理します。
+        
+        Returns:
+            Flask応答オブジェクト
+        """
+        # レート制限をチェック
+        client_ip = request.remote_addr
+        if not self._rate_limit_check(client_ip):
+            self.logger.warning(f"レート制限を超えました: {client_ip}")
+            abort(429, description="レート制限を超えました。しばらく待ってから再試行してください。")
+        
+        # リクエストの内容タイプをチェック
+        if not request.is_json:
+            self.logger.error("JSONではないコンテンツタイプ")
+            abort(415, description="Content-Typeはapplication/jsonである必要があります")
+        
+        # ペイロードを取得
+        payload = request.get_data()
+        if not payload:
+            self.logger.error("空のペイロード")
+            abort(400, description="空のペイロードは受け付けられません")
+        
+        # シグネチャをチェック
+        signature = request.headers.get('X-Signature')
+        if not signature:
+            self.logger.error("シグネチャがヘッダーにありません")
+            abort(401, description="認証が必要です（X-Signatureヘッダーがありません）")
+        
+        if not self._validate_signature(payload, signature):
+            self.logger.error("無効なシグネチャ")
+            abort(401, description="無効なシグネチャ")
+        
+        try:
+            # JSONをパース
+            alert_data = json.loads(payload)
+            
+            # データを検証
+            if not self._validate_alert_data(alert_data):
+                abort(400, description="無効なアラートデータ")
+            
+            # タイムスタンプを追加
+            alert_data["received_at"] = time.time()
+            
+            # アラートを保存
+            self.received_alerts.append(alert_data)
+            
+            # 登録されたハンドラを呼び出す
+            for handler in self.alert_handlers:
+                try:
+                    handler(alert_data)
+                except Exception as e:
+                    self.logger.error(f"ハンドラの実行エラー: {e}")
+            
+            # 成功応答を返す
+            return jsonify({
+                "status": "success",
+                "message": "アラートを正常に受信しました",
+                "alert_id": len(self.received_alerts)
+            })
+            
+        except json.JSONDecodeError:
+            self.logger.error("無効なJSON")
+            abort(400, description="無効なJSONペイロード")
+        except Exception as e:
+            self.logger.error(f"Webhookの処理エラー: {e}")
+            abort(500, description="内部サーバーエラー")
+    
+    def register_alert_handler(self, handler: Callable[[Dict[str, Any]], Any]) -> None:
+        """
+        アラートハンドラを登録します。
+        
+        Args:
+            handler: アラートデータを受け取るコールバック関数
+        """
+        self.alert_handlers.append(handler)
+        self.logger.info(f"アラートハンドラが登録されました: {handler.__name__}")
+    
+    def generate_tradingview_config(self) -> Dict[str, Any]:
+        """
+        TradingViewで使用するための設定情報を生成します。
+        
+        Returns:
+            Dict: WebhookのURL、シグネチャ生成方法、その他の設定情報
+        """
+        base_url = f"http://{self.host}:{self.port}" if self.host != "0.0.0.0" else f"http://localhost:{self.port}"
+        
+        return {
+            "webhook_url": f"{base_url}/webhook",
+            "test_url": f"{base_url}/test",
+            "secret_key": self.secret_key,
+            "header_name": "X-Signature",
+            "signature_method": "HMAC-SHA256",
+            "example_payload": {
+                "time": "2023-04-03T12:00:00Z",
+                "exchange": "BINANCE",
+                "ticker": "BTCUSDT",
+                "bar": {
+                    "open": 50000,
+                    "high": 51000,
+                    "low": 49500,
+                    "close": 50500,
+                    "volume": 100
+                },
+                "strategy": "Example Strategy",
+                "action": "BUY",
+                "price": 50500,
+                "position_size": 0.1,
+                "comment": "例: ゴールデンクロス検出"
+            },
+            "instructions": "上記のsecret_keyを使用して署名を生成し、X-Signatureヘッダーとして含めてください。"
+        }
+    
+    def start(self) -> None:
+        """Webhook受信サーバーを起動します。"""
+        # 起動情報を表示
+        self.logger.info(f"TradingView Webhook受信サーバーを起動します: {self.host}:{self.port}")
+        self.logger.info(f"シークレットキー: {self.secret_key}")
+        self.logger.info("TradingViewの設定情報を取得するには、generate_tradingview_config()を使用してください")
+        
+        # サーバーを起動
+        self.app.run(host=self.host, port=self.port, debug=self.debug)
+
+# 使用例
+if __name__ == "__main__":
+    # インターフェースのインスタンスを作成
+    webhook_interface = TradingViewWebhookInterface(
+        secret_key="your_secret_key_here",  # 固定キーを使用する場合
+        host="0.0.0.0",  # すべてのインターフェースでリッスン
+        port=5000,
+        debug=True
+    )
+    
+    # アラートハンドラの登録例
+    def example_handler(alert_data: Dict[str, Any]) -> None:
+        print(f"新しいアラートを受信: {alert_data['strategy']} - {alert_data.get('action', 'SIGNAL')}")
+        print(f"ティッカー: {alert_data['ticker']} - 価格: {alert_data.get('price')}")
+        # ここで取引実行や通知など、アラートに対するアクションを実行
+    
+    webhook_interface.register_alert_handler(example_handler)
+    
+    # TradingViewの設定情報を表示
+    print(json.dumps(webhook_interface.generate_tradingview_config(), indent=2))
+    
+    # サーバーを起動
+    webhook_interface.start()
