@@ -1,0 +1,137 @@
+import requests
+import json
+import hmac
+import hashlib
+import time
+from typing import Dict, Any
+
+class TradingViewWebhookClient:
+    """
+    TradingViewのWebhookアラートをシミュレートするためのクライアント。
+    実際のTradingViewの動作をテストするために使用します。
+    """
+    
+    def __init__(self, webhook_url: str, secret_key: str):
+        """
+        TradingViewのWebhookクライアントを初期化します。
+        
+        Args:
+            webhook_url: WebhookのURL
+            secret_key: 署名生成用の秘密鍵
+        """
+        self.webhook_url = webhook_url
+        self.secret_key = secret_key
+    
+    def _generate_signature(self, payload: bytes) -> str:
+        """
+        ペイロードの署名を生成します。
+        
+        Args:
+            payload: 署名するデータ
+            
+        Returns:
+            str: HMAC-SHA256署名
+        """
+        return hmac.new(
+            self.secret_key.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+    
+    def send_alert(self, alert_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        アラートをWebhookに送信します。
+        
+        Args:
+            alert_data: 送信するアラートデータ
+            
+        Returns:
+            Dict: サーバーからのレスポンス
+        """
+        # デフォルトの現在時刻を追加（なければ）
+        if "time" not in alert_data:
+            alert_data["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        # JSONに変換
+        payload = json.dumps(alert_data).encode()
+        
+        # 署名を生成
+        signature = self._generate_signature(payload)
+        
+        # ヘッダーを設定
+        headers = {
+            "Content-Type": "application/json",
+            "X-Signature": signature
+        }
+        
+        # リクエストを送信
+        response = requests.post(
+            self.webhook_url,
+            data=payload,
+            headers=headers
+        )
+        
+        # レスポンスを返す
+        return {
+            "status_code": response.status_code,
+            "response": response.json() if response.headers.get("content-type") == "application/json" else response.text,
+            "success": response.status_code == 200
+        }
+    
+    def send_test_alert(self) -> Dict[str, Any]:
+        """
+        テスト用のアラートを送信します。
+        
+        Returns:
+            Dict: サーバーからのレスポンス
+        """
+        test_alert = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "exchange": "BINANCE",
+            "ticker": "BTCUSDT",
+            "bar": {
+                "open": 50000,
+                "high": 51000,
+                "low": 49500,
+                "close": 50500,
+                "volume": 100
+            },
+            "strategy": "テスト戦略",
+            "action": "TEST",
+            "price": 50500,
+            "comment": "これはテストアラートです"
+        }
+        
+        return self.send_alert(test_alert)
+
+# 使用例
+if __name__ == "__main__":
+    client = TradingViewWebhookClient(
+        webhook_url="http://localhost:5000/webhook",
+        secret_key="your_secret_key_here"  # サーバーと同じキーを使用
+    )
+    
+    # テストアラートを送信
+    result = client.send_test_alert()
+    print(f"テスト結果: {json.dumps(result, indent=2)}")
+    
+    # カスタムアラートを送信
+    custom_alert = {
+        "exchange": "BITFLYER",
+        "ticker": "BTCJPY",
+        "bar": {
+            "open": 7500000,
+            "high": 7600000,
+            "low": 7450000,
+            "close": 7550000,
+            "volume": 5.23
+        },
+        "strategy": "簡単なトレンドフォロー",
+        "action": "BUY",
+        "price": 7550000,
+        "position_size": 0.02,
+        "comment": "上昇トレンド検出 - エントリー"
+    }
+    
+    result = client.send_alert(custom_alert)
+    print(f"カスタムアラート結果: {json.dumps(result, indent=2)}")
