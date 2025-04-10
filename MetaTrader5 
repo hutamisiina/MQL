@@ -1,0 +1,775 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import time
+import logging
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Any, Optional, Union, List, Tuple
+
+class OrderType(Enum):
+    """注文タイプの列挙型"""
+    BUY = mt5.ORDER_TYPE_BUY
+    SELL = mt5.ORDER_TYPE_SELL
+    BUY_LIMIT = mt5.ORDER_TYPE_BUY_LIMIT
+    SELL_LIMIT = mt5.ORDER_TYPE_SELL_LIMIT
+    BUY_STOP = mt5.ORDER_TYPE_BUY_STOP
+    SELL_STOP = mt5.ORDER_TYPE_SELL_STOP
+    BUY_STOP_LIMIT = mt5.ORDER_TYPE_BUY_STOP_LIMIT
+    SELL_STOP_LIMIT = mt5.ORDER_TYPE_SELL_STOP_LIMIT
+
+class OrderFilling(Enum):
+    """注文執行タイプの列挙型"""
+    FOK = mt5.ORDER_FILLING_FOK
+    IOC = mt5.ORDER_FILLING_IOC
+    RETURN = mt5.ORDER_FILLING_RETURN
+
+class MT5Trader:
+    """
+    MetaTrader 5取引実行モジュール
+    
+    TradingViewアラートに基づいて取引を実行するためのクラス。
+    ポジションの開設・決済、注文管理、エラーハンドリングなどの機能を提供します。
+    """
+
+    def __init__(self, 
+                 account: int, 
+                 password: str, 
+                 server: str, 
+                 path: Optional[str] = None,
+                 enable_trading: bool = True,
+                 log_level: int = logging.INFO):
+        """
+        MT5Traderクラスの初期化
+        
+        Args:
+            account: MT5アカウント番号
+            password: アカウントパスワード
+            server: MT5サーバー名
+            path: MT5インストールパス（Noneの場合はデフォルトを使用）
+            enable_trading: 実際の取引を有効にするかどうか
+            log_level: ロギングレベル
+        """
+        self.account = account
+        self.password = password
+        self.server = server
+        self.path = path
+        self.enable_trading = enable_trading
+        
+        # ロガーのセットアップ
+        self.logger = self._setup_logger(log_level)
+        
+        # 取引ログ用のデータフレーム
+        self.trade_log = pd.DataFrame(columns=[
+            'timestamp', 'action', 'symbol', 'order_type', 'volume', 
+            'price', 'sl', 'tp', 'result', 'error', 'ticket'
+        ])
+        
+        # 接続状態
+        self.connected = False
+        
+        # デバイス情報
+        self.device_id = "Python_MT5_Trader"
+        
+    def _setup_logger(self, log_level: int) -> logging.Logger:
+        """ロガーのセットアップ"""
+        logger = logging.getLogger("MT5Trader")
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            
+            # ファイルハンドラも追加
+            file_handler = logging.FileHandler("mt5_trader.log")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            
+        logger.setLevel(log_level)
+        return logger
+    
+    def connect(self) -> bool:
+        """
+        MT5プラットフォームに接続します
+        
+        Returns:
+            bool: 接続が成功したかどうか
+        """
+        if self.connected:
+            self.logger.info("既にMT5に接続済みです")
+            return True
+            
+        # MT5の初期化
+        if not mt5.initialize(path=self.path):
+            error = mt5.last_error()
+            self.logger.error(f"MT5の初期化に失敗しました: {error}")
+            return False
+            
+        # アカウントへのログイン
+        login_result = mt5.login(
+            login=self.account,
+            password=self.password,
+            server=self.server
+        )
+        
+        if not login_result:
+            error = mt5.last_error()
+            self.logger.error(f"MT5へのログインに失敗しました: {error}")
+            mt5.shutdown()
+            return False
+            
+        # アカウント情報の取得
+        account_info = mt5.account_info()
+        if account_info:
+            self.logger.info(f"接続成功: アカウント {account_info.login} ({account_info.name})")
+            self.logger.info(f"残高: {account_info.balance} {account_info.currency}")
+            self.logger.info(f"レバレッジ: 1:{account_info.leverage}")
+            
+        self.connected = True
+        return True
+        
+    def disconnect(self) -> None:
+        """MT5プラットフォームとの接続を切断します"""
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            self.logger.info("MT5から切断しました")
+    
+    def _log_trade(self, 
+                   action: str, 
+                   symbol: str, 
+                   order_type: OrderType, 
+                   volume: float, 
+                   price: float, 
+                   sl: Optional[float], 
+                   tp: Optional[float], 
+                   result: bool, 
+                   error: Optional[str], 
+                   ticket: Optional[int]) -> None:
+        """
+        取引ログを記録します
+        
+        Args:
+            action: 取引アクション（open, close, modify等）
+            symbol: 取引銘柄
+            order_type: 注文タイプ
+            volume: 取引数量
+            price: 価格
+            sl: ストップロスレベル
+            tp: テイクプロフィットレベル
+            result: 取引が成功したかどうか
+            error: エラーメッセージ（失敗した場合）
+            ticket: 注文チケット番号
+        """
+        log_entry = pd.DataFrame([{
+            'timestamp': datetime.now(),
+            'action': action,
+            'symbol': symbol,
+            'order_type': order_type.name if isinstance(order_type, OrderType) else order_type,
+            'volume': volume,
+            'price': price,
+            'sl': sl,
+            'tp': tp,
+            'result': result,
+            'error': error,
+            'ticket': ticket
+        }])
+        
+        self.trade_log = pd.concat([self.trade_log, log_entry], ignore_index=True)
+    
+    def _get_error_description(self, error_code: int) -> str:
+        """
+        エラーコードに対応する説明を取得します
+        
+        Args:
+            error_code: MT5エラーコード
+            
+        Returns:
+            str: エラーの説明
+        """
+        error_descriptions = {
+            mt5.RES_S_OK: "正常に完了しました",
+            mt5.RES_E_INTERNAL_ERROR: "内部エラー",
+            mt5.RES_E_INVALID_PARAMS: "無効なパラメータ",
+            mt5.RES_E_NO_MEMORY: "メモリ不足",
+            mt5.RES_E_NOT_FOUND: "見つかりません",
+            mt5.RES_E_INVALID_VERSION: "無効なバージョン",
+            mt5.RES_E_AUTH_FAILED: "認証失敗",
+            mt5.RES_E_UNSUPPORTED: "サポートされていない方法",
+            mt5.RES_E_AUTO_TRADING_DISABLED: "自動売買が無効",
+            mt5.RES_E_INVALID_HANDLE: "無効なハンドル",
+            mt5.RES_E_INVALID_POINTER: "無効なポインタ",
+            mt5.RES_E_INVALID_REQUEST: "無効なリクエスト",
+            mt5.RES_E_INVALID_ACCOUNT: "無効なアカウント",
+            mt5.RES_E_TRADE_DISABLED: "取引が無効",
+            mt5.RES_E_MARKET_CLOSED: "市場が閉じています",
+            mt5.RES_E_TRADE_TIMEOUT: "取引タイムアウト",
+            10018: "市場が閉じています",
+            10019: "注文が拒否されました",
+            10025: "シンボルが無効です",
+            10016: "無効な注文数量",
+            10014: "無効なチケット"
+        }
+        
+        return error_descriptions.get(error_code, f"未知のエラー（コード：{error_code}）")
+    
+    def _get_symbol_info(self, symbol: str) -> Optional[mt5.SymbolInfo]:
+        """
+        銘柄情報を取得します
+        
+        Args:
+            symbol: 銘柄名
+            
+        Returns:
+            SymbolInfo: 銘柄情報、エラーの場合はNone
+        """
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            self.logger.error(f"銘柄情報の取得に失敗しました: {symbol}")
+            return None
+            
+        if not symbol_info.visible:
+            # マーケットウォッチに追加
+            if not mt5.symbol_select(symbol, True):
+                self.logger.error(f"銘柄の選択に失敗しました: {symbol}")
+                return None
+                
+        return symbol_info
+    
+    def get_price(self, symbol: str) -> Optional[Dict[str, float]]:
+        """
+        銘柄の現在価格を取得します
+        
+        Args:
+            symbol: 銘柄名
+            
+        Returns:
+            Dict: 現在価格情報（bid, ask, spread）、エラーの場合はNone
+        """
+        if not self.connected and not self.connect():
+            return None
+            
+        symbol_info = self._get_symbol_info(symbol)
+        if symbol_info is None:
+            return None
+            
+        return {
+            'bid': symbol_info.bid,
+            'ask': symbol_info.ask,
+            'spread': symbol_info.spread,
+            'point': symbol_info.point
+        }
+    
+    def open_position(self, 
+                      symbol: str, 
+                      order_type: Union[OrderType, str], 
+                      volume: float, 
+                      price: Optional[float] = None,
+                      sl_points: Optional[int] = None,
+                      tp_points: Optional[int] = None,
+                      sl_price: Optional[float] = None,
+                      tp_price: Optional[float] = None,
+                      comment: str = "",
+                      magic: int = 0) -> Optional[int]:
+        """
+        新しいポジションを開きます
+        
+        Args:
+            symbol: 銘柄名
+            order_type: 注文タイプ（BUY、SELLなど）
+            volume: 取引数量（ロット）
+            price: 価格（成行注文の場合はNone）
+            sl_points: ストップロス（ポイント）
+            tp_points: テイクプロフィット（ポイント）
+            sl_price: ストップロス（価格指定）
+            tp_price: テイクプロフィット（価格指定）
+            comment: 注文コメント
+            magic: マジックナンバー
+            
+        Returns:
+            int: 成功した場合は注文チケット番号、失敗した場合はNone
+        """
+        if not self.connected and not self.connect():
+            return None
+            
+        # 取引が無効なら実行しない
+        if not self.enable_trading:
+            self.logger.warning("取引が無効に設定されています（シミュレーションモード）")
+            return -1
+            
+        # OrderType列挙型からMT5の定数に変換
+        if isinstance(order_type, str):
+            try:
+                order_type = OrderType[order_type.upper()]
+            except KeyError:
+                self.logger.error(f"無効な注文タイプ: {order_type}")
+                return None
+        
+        # 銘柄情報の取得
+        symbol_info = self._get_symbol_info(symbol)
+        if symbol_info is None:
+            return None
+            
+        # 成行注文の場合の価格計算
+        if price is None:
+            if order_type == OrderType.BUY:
+                price = symbol_info.ask
+            elif order_type == OrderType.SELL:
+                price = symbol_info.bid
+        
+        # ストップロスとテイクプロフィットの計算
+        sl = None
+        tp = None
+        
+        # ポイント指定の場合
+        point = symbol_info.point
+        if sl_points is not None:
+            if order_type == OrderType.BUY:
+                sl = price - (sl_points * point)
+            elif order_type == OrderType.SELL:
+                sl = price + (sl_points * point)
+        
+        if tp_points is not None:
+            if order_type == OrderType.BUY:
+                tp = price + (tp_points * point)
+            elif order_type == OrderType.SELL:
+                tp = price - (tp_points * point)
+        
+        # 価格指定の場合はそれを優先
+        if sl_price is not None:
+            sl = sl_price
+        if tp_price is not None:
+            tp = tp_price
+            
+        # デバイス情報
+        deviation = 20  # 価格ずれの許容範囲（ポイント）
+        
+        # 注文リクエストの作成
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type.value,
+            "price": price,
+            "deviation": deviation,
+            "magic": magic,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        # SLとTPが指定されている場合は追加
+        if sl is not None:
+            request["sl"] = sl
+        if tp is not None:
+            request["tp"] = tp
+        
+        # 注文を送信
+        self.logger.info(f"注文を送信します: {symbol} {order_type.name} {volume}ロット @ {price}")
+        result = mt5.order_send(request)
+        
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            error_desc = self._get_error_description(result.retcode)
+            self.logger.error(f"注文送信エラー: {error_desc} [{result.retcode}]")
+            
+            # ログに記録
+            self._log_trade(
+                "open", symbol, order_type, volume, price, sl, tp, 
+                False, f"{error_desc} [{result.retcode}]", None
+            )
+            return None
+        
+        # 成功した場合
+        self.logger.info(f"ポジションを開きました: チケット #{result.order}, 実行価格: {result.price}")
+        
+        # ログに記録
+        self._log_trade(
+            "open", symbol, order_type, volume, result.price, sl, tp, 
+            True, None, result.order
+        )
+        
+        return result.order
+    
+    def close_position(self, 
+                       ticket: Optional[int] = None,
+                       position_id: Optional[int] = None,
+                       symbol: Optional[str] = None,
+                       comment: str = "") -> bool:
+        """
+        ポジションを閉じます
+        
+        Args:
+            ticket: 注文チケット番号
+            position_id: ポジションID
+            symbol: 銘柄名（全ポジションを閉じる場合）
+            comment: 注文コメント
+            
+        Returns:
+            bool: 成功した場合はTrue、失敗した場合はFalse
+        """
+        if not self.connected and not self.connect():
+            return False
+            
+        # 取引が無効なら実行しない
+        if not self.enable_trading:
+            self.logger.warning("取引が無効に設定されています（シミュレーションモード）")
+            return True
+            
+        # チケット番号からポジションを特定
+        if ticket is not None:
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                self.logger.error(f"チケット #{ticket} のポジションが見つかりません")
+                return False
+            position = positions[0]
+        
+        # ポジションIDからポジションを特定
+        elif position_id is not None:
+            positions = mt5.positions_get(position=position_id)
+            if not positions:
+                self.logger.error(f"ID {position_id} のポジションが見つかりません")
+                return False
+            position = positions[0]
+        
+        # 銘柄名からポジションを特定
+        elif symbol is not None:
+            positions = mt5.positions_get(symbol=symbol)
+            if not positions:
+                self.logger.error(f"銘柄 {symbol} のポジションが見つかりません")
+                return False
+                
+            # 全ポジションを閉じる
+            success = True
+            for pos in positions:
+                if not self._close_single_position(pos, comment):
+                    success = False
+            return success
+        
+        else:
+            self.logger.error("ポジションを特定するためのパラメータが指定されていません")
+            return False
+        
+        # 単一ポジションを閉じる
+        return self._close_single_position(position, comment)
+    
+    def _close_single_position(self, position, comment: str = "") -> bool:
+        """
+        単一のポジションを閉じます
+        
+        Args:
+            position: ポジションオブジェクト
+            comment: 注文コメント
+            
+        Returns:
+            bool: 成功した場合はTrue、失敗した場合はFalse
+        """
+        symbol = position.symbol
+        volume = position.volume
+        ticket = position.ticket
+        position_id = position.identifier
+        
+        # 銘柄情報の取得
+        symbol_info = self._get_symbol_info(symbol)
+        if symbol_info is None:
+            return False
+        
+        # ポジションタイプに応じた反対注文タイプと価格の決定
+        if position.type == mt5.POSITION_TYPE_BUY:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = symbol_info.bid
+            position_type_str = "BUY"
+        else:
+            order_type = mt5.ORDER_TYPE_BUY
+            price = symbol_info.ask
+            position_type_str = "SELL"
+        
+        # 注文リクエストの作成
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "position": position_id,
+            "price": price,
+            "deviation": 20,
+            "magic": 0,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        # 注文を送信
+        self.logger.info(f"ポジション決済リクエスト: チケット #{ticket}, {symbol} {position_type_str} {volume}ロット @ {price}")
+        result = mt5.order_send(request)
+        
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            error_desc = self._get_error_description(result.retcode)
+            self.logger.error(f"ポジション決済エラー: {error_desc} [{result.retcode}]")
+            
+            # ログに記録
+            self._log_trade(
+                "close", symbol, position_type_str, volume, price, None, None, 
+                False, f"{error_desc} [{result.retcode}]", ticket
+            )
+            return False
+        
+        # 成功した場合
+        self.logger.info(f"ポジションを決済しました: チケット #{ticket}, 実行価格: {result.price}")
+        
+        # ログに記録
+        self._log_trade(
+            "close", symbol, position_type_str, volume, result.price, None, None, 
+            True, None, ticket
+        )
+        
+        return True
+    
+    def modify_position(self, 
+                        ticket: int, 
+                        sl: Optional[float] = None, 
+                        tp: Optional[float] = None) -> bool:
+        """
+        ポジションのSL/TPを修正します
+        
+        Args:
+            ticket: ポジションのチケット番号
+            sl: 新しいストップロス価格（Noneの場合は変更なし）
+            tp: 新しいテイクプロフィット価格（Noneの場合は変更なし）
+            
+        Returns:
+            bool: 成功した場合はTrue、失敗した場合はFalse
+        """
+        if not self.connected and not self.connect():
+            return False
+            
+        # 取引が無効なら実行しない
+        if not self.enable_trading:
+            self.logger.warning("取引が無効に設定されています（シミュレーションモード）")
+            return True
+            
+        # ポジションを取得
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            self.logger.error(f"チケット #{ticket} のポジションが見つかりません")
+            return False
+            
+        position = positions[0]
+        
+        # 現在のSL/TPを使用（変更しない場合）
+        if sl is None:
+            sl = position.sl
+        if tp is None:
+            tp = position.tp
+            
+        # 注文リクエストの作成
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": position.identifier,
+            "sl": sl,
+            "tp": tp,
+        }
+        
+        # 注文を送信
+        self.logger.info(f"ポジション修正リクエスト: チケット #{ticket}, SL: {sl}, TP: {tp}")
+        result = mt5.order_send(request)
+        
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            error_desc = self._get_error_description(result.retcode)
+            self.logger.error(f"ポジション修正エラー: {error_desc} [{result.retcode}]")
+            
+            # ログに記録
+            self._log_trade(
+                "modify", position.symbol, position.type, position.volume, position.price_open, 
+                sl, tp, False, f"{error_desc} [{result.retcode}]", ticket
+            )
+            return False
+        
+        # 成功した場合
+        self.logger.info(f"ポジションを修正しました: チケット #{ticket}, SL: {sl}, TP: {tp}")
+        
+        # ログに記録
+        self._log_trade(
+            "modify", position.symbol, position.type, position.volume, position.price_open, 
+            sl, tp, True, None, ticket
+        )
+        
+        return True
+    
+    def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        オープンポジションを取得します
+        
+        Args:
+            symbol: 銘柄名（Noneの場合は全ポジション）
+            
+        Returns:
+            List[Dict]: ポジション情報のリスト
+        """
+        if not self.connected and not self.connect():
+            return []
+            
+        if symbol:
+            positions = mt5.positions_get(symbol=symbol)
+        else:
+            positions = mt5.positions_get()
+            
+        if positions is None or len(positions) == 0:
+            return []
+            
+        result = []
+        for pos in positions:
+            position_type = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+            
+            result.append({
+                'ticket': pos.ticket,
+                'position_id': pos.identifier,
+                'symbol': pos.symbol,
+                'type': position_type,
+                'volume': pos.volume,
+                'open_price': pos.price_open,
+                'current_price': pos.price_current,
+                'sl': pos.sl,
+                'tp': pos.tp,
+                'profit': pos.profit,
+                'comment': pos.comment,
+                'magic': pos.magic,
+                'time_open': datetime.fromtimestamp(pos.time),
+            })
+            
+        return result
+    
+    def get_account_info(self) -> Dict[str, Any]:
+        """
+        アカウント情報を取得します
+        
+        Returns:
+            Dict: アカウント情報
+        """
+        if not self.connected and not self.connect():
+            return {}
+            
+        account_info = mt5.account_info()
+        if account_info is None:
+            return {}
+            
+        return {
+            'login': account_info.login,
+            'server': account_info.server,
+            'balance': account_info.balance,
+            'equity': account_info.equity,
+            'margin': account_info.margin,
+            'free_margin': account_info.margin_free,
+            'margin_level': account_info.margin_level,
+            'leverage': account_info.leverage,
+            'currency': account_info.currency,
+        }
+    
+    def process_trading_view_alert(self, alert_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        TradingViewアラートに基づいて取引を実行します
+        
+        Args:
+            alert_data: アラートデータ
+            
+        Returns:
+            Dict: 実行結果
+        """
+        if not self.connected and not self.connect():
+            return {"success": False, "error": "MT5に接続できません"}
+            
+        # 必須フィールドのチェック
+        required_fields = ["symbol", "action"]
+        for field in required_fields:
+            if field not in alert_data:
+                return {"success": False, "error": f"必須フィールドがありません: {field}"}
+                
+        symbol = alert_data["symbol"]
+        action = alert_data["action"].upper()
+        
+        # 数量の取得（デフォルト0.01ロット）
+        volume = float(alert_data.get("volume", 0.01))
+        
+        # コメント
+        comment = alert_data.get("comment", "TradingView Alert")
+        
+        # マジックナンバー
+        magic = int(alert_data.get("magic", 0))
+        
+        # 価格（指定がなければ現在価格を使用）
+        price = alert_data.get("price")
+        if price is not None:
+            price = float(price)
+            
+        # SL/TP
+        sl_points = alert_data.get("sl_points")
+        tp_points = alert_data.get("tp_points")
+        sl_price = alert_data.get("sl")
+        tp_price = alert_data.get("tp")
+        
+        if sl_points is not None:
+            sl_points = int(sl_points)
+        if tp_points is not None:
+            tp_points = int(tp_points)
+        if sl_price is not None:
+            sl_price = float(sl_price)
+        if tp_price is not None:
+            tp_price = float(tp_price)
+            
+        # チケット（ポジション操作の場合）
+        ticket = alert_data.get("ticket")
+        if ticket is not None:
+            ticket = int(ticket)
+            
+        result = {"success": False, "action": action, "symbol": symbol}
+        
+        try:
+            # アクションに基づいて処理
+            if action in ["BUY", "SELL"]:
+                # ポジションを開く
+                ticket = self.open_position(
+                    symbol=symbol,
+                    order_type=action,
+                    volume=volume,
+                    price=price,
+                    sl_points=sl_points,
+                    tp_points=tp_points,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                    comment=comment,
+                    magic=magic
+                )
+                
+                if ticket is not None:
+                    result["success"] = True
+                    result["ticket"] = ticket
+                else:
+                    result["error"] = "ポジションの開設に失敗しました"
+                    
+            elif action == "CLOSE":
+                # ポジションを閉じる
+                if ticket is not None:
+                    success = self.close_position(ticket=ticket, comment=comment)
+                else:
+                    success = self.close_position(symbol=symbol, comment=comment)
+                    
+                result["success"] = success
+                if not success:
+                    result["error"] = "ポジションの決済に失敗しました"
+                    
+            elif action == "MODIFY":
+                # ポジションを修正
+                if ticket is None:
+                    result["error"] = "ポジション修正にはチケット番号が必要です"
+                else:
+                    success = self.modify_position(
+                        ticket=ticket,
+                        sl=sl_price,
+                        tp=tp_price
+                    )
+                    
+                    result["success"] = success
+                    if not success:
+                        result["error"] = "ポジションの修正に失敗しました"
+                        
+            else:
+                result["error"] = f"
